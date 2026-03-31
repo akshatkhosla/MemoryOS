@@ -1,0 +1,44 @@
+# MemoryOS — Persistent Memory MCP Server
+# All free, open source, runs fully locally.
+
+# ── MCP Server ──────────────────────────────────────────────────
+# The official Anthropic MCP Python SDK. Despite being by Anthropic,
+# it's MIT-licensed and makes NO API calls — it's just a protocol library.
+mcp>=1.0.0
+
+# ── Vector Memory (Episodic Tier) ────────────────────────────────
+# ChromaDB: embedded vector database. Runs in-process, no server needed.
+chromadb>=0.4.0
+
+# ── Embeddings ──────────────────────────────────────────────────
+# SentenceTransformers: local embedding model runner.
+# all-MiniLM-L6-v2 is ~80MB, fast, good quality for semantic search.
+sentence-transformers>=2.2.0
+
+# ── Entity Extraction (Semantic Tier) ───────────────────────────
+# spaCy: industrial NLP. We use the small English model (en_core_web_sm).
+# After pip install, run: python -m spacy download en_core_web_sm
+spacy>=3.7.0
+
+# ── LLM Client (Agent Loop) ──────────────────────────────────────
+# ollama: Python client for local Ollama server.
+# Requires Ollama installed separately: https://ollama.com
+ollama>=0.1.0
+
+# ── Utilities ────────────────────────────────────────────────────
+# pydantic: data validation, used by MCP SDK internally + our schemas
+pydantic>=2.0.0
+
+# python-dateutil: human-readable time calculations for memory metadata
+python-dateutil>=2.8.0
+
+# rich: beautiful terminal output for the CLI chat client
+rich>=13.0.0
+
+# Standard library (no install needed):
+# sqlite3  ← semantic memory store
+# json     ← JSON-RPC message parsing
+# asyncio  ← MCP SDK is fully async
+# uuid     ← memory IDs
+# datetime ← memory timestamps
+# logging  ← debug output
