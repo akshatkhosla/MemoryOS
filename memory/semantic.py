@@ -145,11 +145,16 @@ class SemanticMemory:
         """
         Insert a new fact or update an existing one.
 
-        This is the key operation for semantic memory. Rather than storing
-        duplicates ("user.name = Akshat" appearing 10 times), we:
-        1. Check if (entity, attribute) pair already exists
-        2. If yes: update value + confidence + increment times_confirmed
-        3. If no: insert new fact
+        Supports both single-valued and multi-valued attributes:
+        - Single-valued (e.g., "user.name"): updates existing value
+        - Multi-valued (e.g., "technology.name"): allows multiple values,
+          only updates if SAME VALUE already exists
+
+        This allows tech stacks like:
+          - technology.name = "Python"
+          - technology.name = "ChromaDB"
+          - technology.name = "sentence-transformers"
+        to all be stored instead of overwriting each other.
 
         Args:
             entity:     the subject ("user", "project", "technology")
@@ -159,46 +164,45 @@ class SemanticMemory:
             source:     where this fact came from
 
         Returns:
-            (fact_id, was_updated): True if updated existing, False if inserted new
+            (fact_id, was_updated): True if updated existing fact with same value
 
         Example:
-            fact_id, updated = semantic.upsert_fact("user", "name", "Akshat", 0.99)
-            # First call: inserts new row, updated=False
-            # Second call: increments times_confirmed, updated=True
+            id1, _ = semantic.upsert_fact("technology", "name", "Python", 0.70)
+            id2, _ = semantic.upsert_fact("technology", "name", "ChromaDB", 0.70)
+            # Both facts stored (different values, different IDs)
         """
         entity = entity.lower().strip()
         attribute = attribute.lower().strip()
+        value = value.strip()
         now = datetime.utcnow().isoformat()
 
         with self._get_conn() as conn:
-            # Check for existing fact with same entity+attribute
+            # Check for exact match: same entity + attribute + value
+            # (We update only if the value is identical, not if just attribute matches)
             existing = conn.execute(
-                "SELECT id, value, confidence, times_confirmed FROM facts "
-                "WHERE entity = ? AND attribute = ?",
-                (entity, attribute),
+                "SELECT id, confidence, times_confirmed FROM facts "
+                "WHERE entity = ? AND attribute = ? AND value = ?",
+                (entity, attribute, value),
             ).fetchone()
 
             if existing:
-                # ── UPDATE path ──────────────────────────────────────────
+                # ── UPDATE path: same value seen again ──────────────────────
                 fact_id = existing["id"]
                 old_confidence = existing["confidence"]
 
-                # Confidence update: weighted average of old and new.
-                # If we've seen this fact 5 times with high confidence,
-                # one low-confidence sighting shouldn't tank it.
+                # Confidence update: weighted average of old and new
                 new_confidence = (old_confidence * 0.7) + (confidence * 0.3)
 
                 conn.execute(
                     """
                     UPDATE facts
-                    SET value = ?,
-                        confidence = ?,
+                    SET confidence = ?,
                         times_confirmed = times_confirmed + 1,
                         updated_at = ?,
                         source = ?
                     WHERE id = ?
                     """,
-                    (value, new_confidence, now, source, fact_id),
+                    (new_confidence, now, source, fact_id),
                 )
                 logger.debug(
                     f"Updated fact: {entity}.{attribute} = {value!r} "
@@ -207,7 +211,7 @@ class SemanticMemory:
                 return fact_id, True
 
             else:
-                # ── INSERT path ──────────────────────────────────────────
+                # ── INSERT path: new entity+attribute+value combination ────
                 fact_id = str(uuid.uuid4())
                 conn.execute(
                     """

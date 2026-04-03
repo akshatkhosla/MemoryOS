@@ -27,7 +27,7 @@ ARCHITECTURE:
                                              ▼         │
                                      ┌───────────────────────┐
                                      │  Ollama (local LLM)   │
-                                     │  llama3.2 / mistral   │
+                                     │  qwen2.5:7b / others  │
                                      └───────────────────────┘
                                              │         ▲
                                       MCP tool calls   │
@@ -287,11 +287,16 @@ class MCPClient:
         for fact in self._mem.semantic.search_facts(query)[:top_k]:
             results.append({"tier": "semantic", "content": f"{fact['entity']}.{fact['attribute']} = {fact['value']!r}", "score": fact["confidence"]})
         for mem in self._mem.episodic.recall(query, top_k, min_importance):
-            results.append({"tier": "episodic", "content": mem["content"], "score": mem["relevance_score"]})
+            # Format episodic memories to make clear these are EXACT stored content
+            # Strip "User said: " prefix to show just what was stored
+            content = mem["content"]
+            if content.startswith("User said: "):
+                content = content[len("User said: "):]
+            results.append({"tier": "episodic", "content": content, "score": mem["relevance_score"]})
         if not results:
             return f"No memories found for: {query!r}"
         results.sort(key=lambda r: r["score"], reverse=True)
-        lines = [f"Found {len(results[:top_k])} memories for: {query!r}"]
+        lines = [f"Found {len(results[:top_k])} memories for: {query!r}\n(These are EXACT stored memories — do not elaborate or infer details)"]
         for i, r in enumerate(results[:top_k], 1):
             lines.append(f"{i}. [{r['tier'].upper()}] ({r['score']:.0%}) {r['content']}")
         return "\n".join(lines)
@@ -300,12 +305,63 @@ class MCPClient:
         entities = self._mem.semantic.get_all_entities()
         if not entities:
             return "No entities in semantic memory."
-        lines = []
+        
+        # Format as natural language facts with confidence scores
+        # This encourages the LLM to respond conversationally while showing certainty
+        lines = ["Here's what I know about you from past conversations:"]
+        
         for entity in entities:
             facts = self._mem.semantic.get_entity_facts(entity)
-            lines.append(f"{entity.upper()}:")
-            for f in facts:
-                lines.append(f"  {f['attribute']}: {f['value']!r} ({int(f['confidence']*100)}%)")
+            
+            # Build natural language for this entity
+            if entity == "user":
+                user_facts = []
+                for f in facts:
+                    attr = f['attribute']
+                    val = f['value']
+                    conf = int(f['confidence'] * 100)
+                    
+                    # Map attributes to natural language with confidence
+                    if attr == "name":
+                        user_facts.append(f"Your name is {val} ({conf}%)")
+                    elif attr == "location":
+                        user_facts.append(f"You're based in {val} ({conf}%)")
+                    elif attr == "role":
+                        user_facts.append(f"You work as a {val} ({conf}%)")
+                    elif attr == "experience_years":
+                        user_facts.append(f"You have {val} years of experience ({conf}%)")
+                    elif attr == "tech_preference":
+                        user_facts.append(f"You prefer using {val} ({conf}%)")
+                    elif attr == "tool_usage":
+                        user_facts.append(f"You use {val} ({conf}%)")
+                    else:
+                        user_facts.append(f"{attr}: {val} ({conf}%)")
+                
+                if user_facts:
+                    lines.append("• " + "\n• ".join(user_facts))
+            
+            elif entity == "project":
+                project_facts = []
+                for f in facts:
+                    attr = f['attribute']
+                    val = f['value']
+                    conf = int(f['confidence'] * 100)
+                    if attr == "name":
+                        project_facts.append(f"Project: {val} ({conf}%)")
+                    else:
+                        project_facts.append(f"{attr}: {val} ({conf}%)")
+                if project_facts:
+                    lines.append("Projects:\n  • " + "\n  • ".join(project_facts))
+            
+            elif entity == "technology":
+                tech_facts = []
+                for f in facts:
+                    val = f['value']
+                    conf = int(f['confidence'] * 100)
+                    tech_facts.append(f"{val} ({conf}%)")
+                if tech_facts:
+                    lines.append(f"Technologies you mentioned: {', '.join(tech_facts)}")
+        
         return "\n".join(lines)
 
     async def _summarise_memories(self, max_memories: int = 20) -> str:
@@ -347,7 +403,11 @@ class MCPClient:
 
         if role == "user":
             importance = self._ext.compute_importance(content, [])
-            if importance >= 0.55:
+            # Store to episodic memory if importance >= 0.50
+            # This ensures even moderately important content is remembered across sessions.
+            # With compute_importance's new technical problem boost (0.35), even a single-line
+            # bug report will score 0.85 and definitely get stored.
+            if importance >= 0.50:
                 session_id = self._mem.working.get_session_summary()["session_id"]
                 self._mem.episodic.store(
                     f"User said: {content}",
@@ -384,29 +444,51 @@ class OllamaAgent:
     """
 
     SYSTEM_PROMPT = """You are a helpful AI assistant with persistent memory.
-You have access to a memory system that remembers information across conversations.
+You have access to a memory system that stores real information from past conversations.
 
-At the start of each conversation:
-1. Call list_entities() to load known facts about the user
-2. Use recall() if the user asks about something you might have discussed before
+MANDATORY RULES — follow these without exception:
 
-During conversation:
-- Call store_conversation_turn() after each user message to build memory
-- Call remember() for important facts, preferences, or events worth storing
-- Call recall() when you need context from past conversations
+1. NEVER answer questions about past conversations, problems, bugs, or events from
+   your own knowledge or imagination. ALWAYS call recall() first.
 
-Be proactive about using memory — a user who shared their name or preferences
-expects you to remember them next time.
+2. When a user asks ANYTHING about:
+   - what they told you before
+   - past bugs, errors, or technical problems
+   - previous conversations or sessions
+   - what you remember about them
+   You MUST call recall() with a relevant query BEFORE forming any response.
 
-Keep responses concise and helpful. You're running on a local Ollama instance."""
+3. After calling recall():
+   - If results are found: answer ONLY from what the results say, word for word.
+   - If no results are found: say "I don't have any memory of that. Could you remind me?"
+   - NEVER fill gaps with guesses, assumptions, or plausible-sounding details.
+   - NEVER say "as per our previous conversation" if you have not called recall() first.
+
+4. Do NOT fabricate details. If recall() returns "ChromaDB error", say exactly that.
+   Do not add context like "race condition" or "API integration" unless the memory says so.
+
+5. When the user asks "what do you know about me?":
+   - At session start, facts are automatically loaded and injected into your context.
+   - Read those facts carefully and respond CONVERSATIONALLY, not by repeating the raw data.
+   - Instead of: "location: 'Hyderabad' (80%) name: 'Akshat' (75%)"
+   - Say: "You're Akshat, a software engineer based in Hyderabad."
+
+6. If facts are loaded but incomplete, acknowledge what you know and ask for missing details.
+   Example: "I know you're in Hyderabad, but could you remind me of your exact role?"
+
+7. At the start of each session, facts are loaded automatically. Call remember() when 
+   the user shares important NEW facts, bugs, preferences, or events.
+
+The user can verify everything you say against stored memory. Fabricated answers
+will be caught immediately. When in doubt, call recall() and report exactly what it returns."""
 
     MAX_TOOL_ITERATIONS = 5  # prevent infinite tool loops
 
-    def __init__(self, model: str = "llama3.2"):
+    def __init__(self, model: str = "qwen2.5:7b"):
         """
         Args:
-            model: Ollama model name. Must be pulled first: ollama pull llama3.2
-                   Other good options: mistral, llama3.1, gemma2
+            model: Ollama model name. Must be pulled first: ollama pull qwen2.5:7b
+                   Other options: llama3.2, mistral, llama3.1, gemma2
         """
         self._model = model
         self._mcp = MCPClient()
@@ -540,11 +622,61 @@ Keep responses concise and helpful. You're running on a local Ollama instance.""
 
     async def initialize_session(self) -> str:
         """
-        Load memory context at session start.
+        Load memory context at session start and inject it into conversation history.
 
-        Called by chat.py before the first user message.
-        Returns a summary of what the agent loaded.
+        This is the critical fix for hallucination. Previously, loaded context was
+        only shown in the terminal banner — the LLM never saw it in its message history.
+        Now we inject it as the first message in conversation_history so the LLM
+        actually has the memory content available when generating responses.
+
+        Two-step load:
+        1. list_entities() — structured facts (name, location, role, project)
+        2. recall() — recent episodic memories (bugs, discussions, events)
+
+        Returns the context string for display in the terminal banner.
         """
         logger.info("Initializing session — loading memory context")
+
+        # Step 1: load structured facts
         facts = await self._mcp.call_tool("list_entities", {})
-        return facts
+
+        # Step 2: load recent episodic memories broadly
+        # Use a broad query so we surface bugs, discussions, and any past events
+        recent_memories = await self._mcp.call_tool("recall", {
+            "query": "problems bugs errors technical issues discussions preferences",
+            "top_k": 5,
+        })
+
+        # Build the context string
+        context_parts = []
+        has_facts = facts and "No entities" not in facts
+        has_memories = recent_memories and "No memories found" not in recent_memories
+
+        if has_facts:
+            context_parts.append("=== Known Facts About You ===")
+            context_parts.append(facts)
+
+        if has_memories:
+            context_parts.append("\n=== Recent Memories From Past Sessions ===")
+            context_parts.append(recent_memories)
+
+        if not context_parts:
+            return "No previous memories found. Starting fresh."
+
+        context_str = "\n".join(context_parts)
+
+        # CRITICAL FIX: inject context into conversation history as a tool result.
+        # This means the LLM actually sees this memory when generating its first response.
+        # Without this injection, the LLM starts with an empty context window and
+        # has no choice but to fabricate answers about past events.
+        self._conversation_history.append({
+            "role": "tool",
+            "content": (
+                "MEMORY CONTEXT LOADED AT SESSION START:\n"
+                + context_str
+                + "\n\nIMPORTANT: The above is your ONLY source of truth about past "
+                "conversations. Do not add, infer, or elaborate beyond what is written above."
+            ),
+        })
+
+        return context_str

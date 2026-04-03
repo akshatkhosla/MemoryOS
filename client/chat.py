@@ -19,6 +19,7 @@ SPECIAL COMMANDS:
     /reset    — clear conversation (keeps persistent memory)
     /help     — show commands
     /quit     — exit
+    /bye      — exit (alias for /quit)
 """
 
 import asyncio
@@ -76,6 +77,7 @@ HELP_TEXT = """
   [green]/status[/green]        Show memory system status
   [green]/help[/green]          Show this help
   [green]/quit[/green]          Exit
+  [green]/bye[/green]           Exit (alias for /quit)
 
 [dim]Tip: Just chat normally — the agent will automatically
 store and recall memories as needed.[/dim]
@@ -120,7 +122,7 @@ def print_tool_activity(tool_name: str, result_preview: str):
 
 # ── Main Chat Loop ────────────────────────────────────────────────────────────
 
-async def run_chat(model: str = "llama3.2"):
+async def run_chat(model: str = "qwen2.5:7b"):
     """
     Main async chat loop.
 
@@ -130,7 +132,7 @@ async def run_chat(model: str = "llama3.2"):
     console.print(BANNER, style="cyan")
     console.print(
         f"[dim]Using model: [bold]{model}[/bold] | "
-        f"Type /help for commands | /quit to exit[/dim]\n"
+        f"Type /help for commands | /quit or /bye to exit[/dim]\n"
     )
 
     # ── Initialize agent ──────────────────────────────────────────────────
@@ -206,7 +208,7 @@ async def handle_command(command: str, agent: OllamaAgent):
     cmd = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
 
-    if cmd == "/quit" or cmd == "/exit" or cmd == "/q":
+    if cmd == "/quit" or cmd == "/exit" or cmd == "/q" or cmd == "/bye":
         console.print("[dim]Goodbye! Your memories are saved.[/dim]")
         sys.exit(0)
 
@@ -274,8 +276,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MemoryOS Chat Client")
     parser.add_argument(
         "--model",
-        default="llama3.2",
-        help="Ollama model to use (default: llama3.2). Must be pulled first.",
+        default="qwen2.5:7b",
+        help="Ollama model to use (default: qwen2.5:7b). Must be pulled first.",
     )
     args = parser.parse_args()
 

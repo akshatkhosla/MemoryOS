@@ -397,15 +397,29 @@ class Extractor:
 
     def _deduplicate_facts(self, facts: list[dict]) -> list[dict]:
         """
-        Remove duplicate entity+attribute pairs, keeping highest confidence.
+        Remove duplicate entity+attribute+value tuples, keeping highest confidence.
 
-        When both spaCy and a pattern find the same fact (e.g., user.name),
+        When both spaCy and a pattern find the same fact (e.g., user.name = Akshat),
         we keep the higher-confidence version.
+        
+        CRITICAL: Include value in the deduplication key so that different values
+        are NOT discarded. This allows storing multiple technologies in tech stacks.
+        
+        Example:
+        - Same fact, different sources → keep highest confidence
+          {entity:"technology", attribute:"name", value:"Python", confidence:0.70}
+          {entity:"technology", attribute:"name", value:"Python", confidence:0.85}
+          → Keep the 0.85 version
+        
+        - Different values → keep BOTH (not deduplicated)
+          {entity:"technology", attribute:"name", value:"Python", confidence:0.70}
+          {entity:"technology", attribute:"name", value:"ChromaDB", confidence:0.70}
+          → Keep both (they have different values)
         """
-        seen: dict[tuple, dict] = {}  # (entity, attribute) → best fact
+        seen: dict[tuple, dict] = {}  # (entity, attribute, value) → best fact
 
         for fact in facts:
-            key = (fact["entity"], fact["attribute"])
+            key = (fact["entity"], fact["attribute"], fact["value"])
             if key not in seen or fact["confidence"] > seen[key]["confidence"]:
                 seen[key] = fact
 
@@ -454,17 +468,30 @@ class Extractor:
         Higher importance = prioritized in recall when scores are equal.
 
         Heuristic rules:
-        - More named entities → higher importance (it's "about" something specific)
-        - Contains personal facts (name, location) → high importance
-        - Questions from user → medium importance
-        - Generic greetings → low importance
+        - Technical problems (bugs/errors) → HIGH importance (0.7+)
+        - Personal identity facts → high importance (0.7+)
+        - Goals and project work → medium-high importance (0.6+)
+        - Named entities → boost (0.05 per entity)
+        - Generic greetings → low importance penalty
+        - Short content → low importance penalty
 
-        This is a simple rule-based system. In a production system you'd
-        train a classifier or use an LLM judge for this.
+        This ensures critical development issues are stored even if brief,
+        while enabling cross-session problem tracking.
         """
         score = 0.5  # baseline
 
         content_lower = content.lower()
+
+        # CRITICAL: Technical problems → very high importance
+        # Issues like "I hit a bug" or "Error: connection failed" MUST be remembered
+        # Boost is 0.35 so even a one-liner bug gets 0.85 importance
+        if any(word in content_lower for word in [
+            "error", "bug", "crash", "fail", "broke", "broken", "exception",
+            "threw", "throwing", "traceback", "stack overflow", "segfault",
+            "issue", "problem", "fix", "fixed", "resolved", "solution",
+            "debug", "debugging"
+        ]):
+            score += 0.35
 
         # Boost: has named entities (the content is about something specific)
         entity_boost = min(len(entities) * 0.05, 0.2)
@@ -475,19 +502,23 @@ class Extractor:
             score += 0.2
 
         # Boost: goals and preferences (useful to remember long-term)
-        if any(word in content_lower for word in ["want to", "prefer", "goal", "building", "working on"]):
+        if any(word in content_lower for word in ["want to", "prefer", "goal", "building", "working on", "learning"]):
             score += 0.15
 
-        # Boost: technical specifics (useful for engineering assistants)
-        if any(word in content_lower for word in ["error", "bug", "issue", "problem", "solution", "fixed"]):
-            score += 0.1
+        # Boost: deliverables and accomplishments
+        if any(word in content_lower for word in ["completed", "finished", "shipped", "deployed", "released", "launched"]):
+            score += 0.15
 
-        # Penalty: generic content
-        if any(word in content_lower for word in ["hello", "hi", "thanks", "okay", "sure", "yes", "no"]):
-            score -= 0.2
-
-        # Penalty: very short content (probably low information)
-        if len(content.split()) < 5:
+        # IMPORTANT: Don't heavily penalize short technical content
+        # A one-line bug report "ChromaDB threw error X" is more important than a long greeting
+        # Only penalize if it's BOTH short AND has no technical keywords
+        if len(content.split()) < 5 and not any(word in content_lower for word in [
+            "error", "bug", "crash", "fail", "broke", "broken", "exception"
+        ]):
             score -= 0.1
+
+        # Penalty: generic conversational fluff
+        if any(word in content_lower for word in ["hello", "hi", "thanks", "okay", "sure", "yes", "no"]):
+            score -= 0.15
 
         return max(0.0, min(1.0, score))
