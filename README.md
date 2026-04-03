@@ -237,12 +237,14 @@ See MemoryOS in action:
 Watch how standard Ollama loses all context between sessions. Tell the model your name and preferences in one chat, then start a new session—it has zero memory of you:
 
 https://github.com/user-attachments/assets/fbe40151-ab22-40b2-8a57-cbdead2aed7b
+
 *This video shows why MemoryOS was built: Ollama cannot retain information across separate conversation sessions.*
 
 ### The Solution: MemoryOS With Persistent Memory
 See MemoryOS solve the problem. Share your information once, then watch it persist automatically across sessions. The LLM remembers your name, preferences, past projects, and technical context without you repeating yourself:
 
 https://github.com/user-attachments/assets/3dd9ea8b-f54b-4d22-9305-1ebbc6e5f402
+
 *This video demonstrates the full MemoryOS workflow: memory extraction, multi-tier storage, semantic search, entity recall, and conversational context injection.*
 
 ---
