@@ -90,7 +90,15 @@ PERSONAL_FACT_PATTERNS = [
     # Only explicit preference verbs: prefer/love/enjoy/mainly use/primarily use.
     # Removed "i use" and "i like" — too broad.
     # "I use X for Y" goes to tool_usage instead.
-    (r"(?:i (?:prefer|love|enjoy|mainly use|primarily use)|my (?:preferred|favourite|favorite|go-to) (?:language|framework|tool|stack) is)\s+(?P<value>[A-Za-z][A-Za-z0-9#+.\-]{0,20})",
+    # Tech preference: value must be a plausible technology name, not an adjective/adverb.
+    # Negative lookahead on the VALUE blocks common English words:
+    #   "I prefer very" → "very" is in blocklist → no match ✅
+    #   "I prefer concise" → "concise" is in blocklist → no match ✅
+    #   "I prefer Python" → "Python" not in blocklist → matches ✅
+    #   "I prefer not to" → "not" is in blocklist → no match ✅
+    (r"(?:i (?:prefer|love|enjoy|mainly use|primarily use)|my (?:preferred|favourite|favorite|go-to) (?:language|framework|tool|stack) is)"
+     r"\s+(?!(?:very|quite|really|extremely|highly|fairly|rather|pretty|somewhat|concise|simple|clean|clear|fast|slow|easy|hard|good|bad|better|best|not|no|never|always|often|more|most|less|least|much|many|few|any|all|both|each|every|some|other|another|such|same|different|various|new|old|big|small|large|short|long|high|low|first|last|next|this|that|these|those|it|its|my|your|his|her|our|their)\b)"
+     r"(?P<value>[A-Z][A-Za-z0-9#+.\-]{1,20}|\b(?:python|javascript|typescript|golang|rust|java|ruby|swift|kotlin|scala|bash|sql|go|c\+\+|c#)\b)",
      "user", "tech_preference"),
 
     # ── PROJECT NAME ──────────────────────────────────────────────────────────
@@ -98,8 +106,16 @@ PERSONAL_FACT_PATTERNS = [
     # Removed bare "working on" — matches too many assistant phrases.
     # Value must start with uppercase (proper project name).
     # Optional article (a/an/the) before the name is swallowed.
-    (r"(?:i(?:'m| am) building|my project (?:is called|is named|is|called))\s+(?:a |an |the )?(?P<value>[A-Z][A-Za-z0-9\-_]{1,40}(?:\s+[A-Z][A-Za-z0-9\-_]{1,40})?)",
-     "project", "name"),
+    # PROJECT NAME — compiled WITHOUT re.IGNORECASE (unlike other patterns).
+    # Why: Python's re.IGNORECASE makes [A-Z] match lowercase too, so
+    # "I'm building understanding" would match "understanding" as a project name.
+    # By dropping IGNORECASE and writing [Ii]/[Mm]y explicitly, [A-Z] in the
+    # VALUE group strictly enforces that project names start with a capital letter.
+    # "I'm building a project called X" and "my project is/called/named X" all match.
+    # "I'm building something new" / "my project is going well" do NOT match.
+    # NOTE: this tuple has a 4th element (False) = do NOT compile with IGNORECASE.
+    (r"(?:[Ii](?:'m| am| AM) building(?: a project called)?|[Ii](?:'m| am| AM) working on(?: a project called)?|[Mm]y project (?:is called|is named|is|called))\s+(?:a |an |the )?(?P<value>[A-Z][A-Za-z0-9\-_]{1,39}(?:\s+[A-Z][A-Za-z0-9\-_]{1,40})?)",
+     "project", "name", False),
 
     # ── TOOL USAGE ────────────────────────────────────────────────────────────
     # "I use X for Y" — explicit "I use" only (removed "we use" and "using").
@@ -109,10 +125,18 @@ PERSONAL_FACT_PATTERNS = [
      "user", "tool_usage"),
 ]
 
-# Compile patterns once at module load (performance)
+# Compile patterns once at module load (performance).
+# Each tuple is (pattern, entity, attribute) or (pattern, entity, attribute, use_ignorecase).
+# use_ignorecase defaults to True; set False for patterns where the VALUE group
+# must strictly enforce uppercase (e.g. project names).
 COMPILED_PATTERNS = [
-    (re.compile(pattern, re.IGNORECASE), entity, attribute)
-    for pattern, entity, attribute in PERSONAL_FACT_PATTERNS
+    (
+        re.compile(pattern, re.IGNORECASE if (len(t) < 4 or t[3]) else 0),
+        t[1],
+        t[2],
+    )
+    for t in PERSONAL_FACT_PATTERNS
+    for pattern in [t[0]]
 ]
 
 
@@ -268,6 +292,21 @@ class Extractor:
 
             if ent.label_ == "PERSON" and is_first_person:
                 # "I'm Akshat" → user.name
+                # Block known tech terms that spaCy sometimes tags as PERSON.
+                # e.g. "I prefer Python" → spaCy tags "Python" as PERSON → wrong.
+                _TECH_TERMS = {
+                    "python", "javascript", "typescript", "java", "golang", "rust",
+                    "chromadb", "sqlite", "postgresql", "mongodb", "redis", "docker",
+                    "kubernetes", "azure", "aws", "gcp", "linux", "flask", "django",
+                    "fastapi", "react", "angular", "vue", "ollama", "llama", "mistral",
+                    "qwen", "git", "github", "windows", "macos", "ubuntu", "debian",
+                    "tensorflow", "pytorch", "numpy", "pandas", "spark", "kafka",
+                }
+                if entity_text.lower() in _TECH_TERMS:
+                    continue  # skip — not a person name
+                # Also skip single-word entities that are ALL CAPS (acronyms, not names)
+                if entity_text.isupper() and len(entity_text) <= 4:
+                    continue
                 facts.append({
                     "entity": "user",
                     "attribute": "name",
@@ -286,8 +325,20 @@ class Extractor:
                     "source": "spacy_GPE",
                 })
 
-            elif ent.label_ == "ORG":
+            elif ent.label_ == "ORG" and is_first_person:
                 # "I work at Microsoft" → organization.name
+                # Guard 1: require is_first_person — we only care about orgs the
+                #          USER mentions, not every org in the conversation.
+                # Guard 2: skip timezone/calendar acronyms and very short noise.
+                _NOISE_ORGS = {
+                    "ist", "gmt", "utc", "pst", "est", "cst", "mst", "bst",
+                    "am", "pm", "ai", "ml", "api", "sdk", "ide", "os", "ui",
+                }
+                if entity_text.lower() in _NOISE_ORGS:
+                    continue
+                # Skip pure-acronym entities under 4 chars (too noisy)
+                if entity_text.isupper() and len(entity_text) < 4:
+                    continue
                 facts.append({
                     "entity": "organization",
                     "attribute": "name",

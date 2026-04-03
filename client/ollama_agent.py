@@ -152,31 +152,9 @@ MEMORY_TOOLS = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "store_conversation_turn",
-            "description": (
-                "Store the current conversation turn in memory with entity extraction. "
-                "Call this automatically after processing each user message."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "role": {
-                        "type": "string",
-                        "enum": ["user", "assistant"],
-                        "description": "Who sent this message.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The message content.",
-                    },
-                },
-                "required": ["role", "content"],
-            },
-        },
-    },
+    # store_conversation_turn is intentionally NOT exposed to the LLM.
+    # It is an internal tool called directly by the agent loop in chat().
+    # Exposing it caused the LLM to call it incorrectly or with missing args.
 ]
 
 
@@ -241,6 +219,11 @@ class MCPClient:
             elif tool_name == "summarise_memories":
                 return await self._summarise_memories(**arguments)
             elif tool_name == "store_conversation_turn":
+                # Guard: LLM sometimes calls this without required args.
+                # Silently skip rather than crash — the turn is already in
+                # working memory from the explicit add_turn() call in chat().
+                if "role" not in arguments or "content" not in arguments:
+                    return "Skipped: missing role or content argument."
                 return await self._store_turn(**arguments)
             elif tool_name == "forget":
                 return await self._forget(**arguments)
@@ -250,32 +233,56 @@ class MCPClient:
             logger.error(f"Tool call failed: {e}", exc_info=True)
             return f"Tool error: {str(e)}"
 
-    async def _remember(self, content: str, importance: float = 0.5, tier=None) -> str:
+    async def _remember(self, content: str, importance=0.5, tier=None) -> str:
+        # The LLM sometimes passes importance as a string ("0.8") instead of float.
+        # Always coerce to float defensively — this prevents the :.0% format crash.
+        try:
+            importance = float(importance)
+        except (TypeError, ValueError):
+            importance = 0.5
+
         entities = self._ext.extract_entities(content)
         entity_strings = [e["text"] for e in entities]
+
+        # Only auto-compute importance if the caller left it at the default
         if importance == 0.5:
             importance = self._ext.compute_importance(content, entities)
+
         tier = tier or self._ext.classify_memory_tier(content)
 
-        if tier == "semantic":
-            facts = self._ext.extract_facts(content, role="user")
-            if facts:
-                best = max(facts, key=lambda f: f["confidence"])
-                fid, updated = self._mem.semantic.upsert_fact(
-                    best["entity"], best["attribute"], best["value"], best["confidence"]
-                )
-                action = "Updated" if updated else "Stored"
-                return f"{action} semantic fact: {best['entity']}.{best['attribute']} = {best['value']!r}"
-
-        session_id = self._mem.working.get_session_summary()["session_id"]
-        mid = self._mem.episodic.store(content, importance, session_id=session_id, entities=entity_strings)
-        # Also upsert high-confidence facts
-        for fact in self._ext.extract_facts(content, "user"):
+        # Always try to extract and store structured facts into semantic memory,
+        # regardless of which tier the content is routed to.
+        # This is the key fix for "/entities showing empty" — facts were only being
+        # extracted on the episodic path, so semantic-tier content never got stored.
+        facts_stored = []
+        for fact in self._ext.extract_facts(content, role="user"):
             if fact["confidence"] >= 0.75:
-                self._mem.semantic.upsert_fact(fact["entity"], fact["attribute"], fact["value"], fact["confidence"])
-        return f"Stored episodic memory [{mid[:8]}] (importance: {importance:.0%})"
+                self._mem.semantic.upsert_fact(
+                    fact["entity"], fact["attribute"], fact["value"], fact["confidence"]
+                )
+                facts_stored.append(f"{fact['entity']}.{fact['attribute']}={fact['value']!r}")
 
-    async def _recall(self, query: str, top_k: int = 5, min_importance: float = 0.0) -> str:
+        if tier == "semantic" and facts_stored:
+            return f"Stored semantic facts: {', '.join(facts_stored)}"
+
+        # Store to episodic memory
+        session_id = self._mem.working.get_session_summary()["session_id"]
+        mid = self._mem.episodic.store(
+            content, importance, session_id=session_id, entities=entity_strings
+        )
+        facts_note = f", facts: {', '.join(facts_stored)}" if facts_stored else ""
+        return f"Stored episodic memory [{mid[:8]}] (importance: {importance:.0%}{facts_note})"
+
+    async def _recall(self, query: str, top_k=5, min_importance=0.0) -> str:
+        # Coerce LLM-supplied args — may arrive as strings
+        try:
+            top_k = int(top_k)
+        except (TypeError, ValueError):
+            top_k = 5
+        try:
+            min_importance = float(min_importance)
+        except (TypeError, ValueError):
+            min_importance = 0.0
         results = []
         for fact in self._mem.semantic.search_facts(query)[:top_k]:
             results.append({"tier": "semantic", "content": f"{fact['entity']}.{fact['attribute']} = {fact['value']!r}", "score": fact["confidence"]})
@@ -317,17 +324,44 @@ class MCPClient:
 
     async def _store_turn(self, role: str, content: str, auto_extract: bool = True) -> str:
         entities = []
-        if auto_extract and role == "user":
+        facts_stored = []
+
+        # Only extract facts from USER messages — never assistant responses.
+        if auto_extract and role == "user" and len(content.strip()) > 10:
             entities = self._ext.get_entity_strings(content)
-            for fact in self._ext.extract_facts(content, role):
+            facts = self._ext.extract_facts(content, role="user")
+
+            for fact in facts:
+                # Threshold 0.70 — matches what our patterns actually output (0.75)
+                # and spaCy NER outputs (0.75-0.85).
+                # The previous threshold of 0.80 was silently dropping ALL pattern-based
+                # facts because patterns output 0.75, which is below 0.80.
                 if fact["confidence"] >= 0.70:
-                    self._mem.semantic.upsert_fact(fact["entity"], fact["attribute"], fact["value"], fact["confidence"])
+                    self._mem.semantic.upsert_fact(
+                        fact["entity"], fact["attribute"], fact["value"],
+                        fact["confidence"], source="auto_extraction"
+                    )
+                    facts_stored.append(f"{fact['entity']}.{fact['attribute']}={fact['value']!r}")
+
         tid = self._mem.working.add_turn(role, content, entities)
-        importance = self._ext.compute_importance(content, [])
-        if importance >= 0.6:
-            session_id = self._mem.working.get_session_summary()["session_id"]
-            self._mem.episodic.store(f"{role}: {content}", importance, session_id=session_id, entities=entities)
-        return f"Stored turn {tid[:8]} (role={role}, entities={entities or 'none'}, importance={importance:.2f})"
+
+        if role == "user":
+            importance = self._ext.compute_importance(content, [])
+            if importance >= 0.55:
+                session_id = self._mem.working.get_session_summary()["session_id"]
+                self._mem.episodic.store(
+                    f"User said: {content}",
+                    importance,
+                    session_id=session_id,
+                    entities=entities,
+                )
+            return (
+                f"Stored user turn {tid[:8]} "
+                f"(importance={importance:.2f}, "
+                f"facts={facts_stored if facts_stored else 'none'})"
+            )
+
+        return f"Stored assistant turn {tid[:8]} in working memory only"
 
     async def _forget(self, memory_id: str) -> str:
         if self._mem.episodic.delete(memory_id):
@@ -424,6 +458,9 @@ Keep responses concise and helpful. You're running on a local Ollama instance.""
                     *self._conversation_history,
                 ],
                 tools=MEMORY_TOOLS,
+                options={
+                    "num_ctx": 32768,   # 32k context window
+                },
             )
 
             message = response["message"]
@@ -441,10 +478,14 @@ Keep responses concise and helpful. You're running on a local Ollama instance.""
                     "content": final_response,
                 })
 
-                # Store assistant turn in memory too
+                # Store assistant turn in WORKING MEMORY ONLY (no episodic, no extraction).
+                # The assistant's words are NOT facts about the user — storing them to
+                # episodic/semantic memory causes false extractions like treating the
+                # assistant's own statements as user preferences.
                 await self._mcp.call_tool("store_conversation_turn", {
                     "role": "assistant",
                     "content": final_response,
+                    "auto_extract": False,
                 })
 
                 return final_response
