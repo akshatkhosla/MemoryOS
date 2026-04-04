@@ -502,9 +502,10 @@ will be caught immediately. When in doubt, call recall() and report exactly what
 
         This is the main agent loop:
         1. Add user message to history
-        2. Call Ollama with full history + tools
-        3. If Ollama requests tools: execute them, add results, loop
-        4. Return final text response
+        2. Proactively recall relevant memories (don't rely on LLM to call tools)
+        3. Call Ollama with full history + tools
+        4. If Ollama requests tools: execute them, add results, loop
+        5. Return final text response
 
         Args:
             user_message: the user's input text
@@ -523,6 +524,34 @@ will be caught immediately. When in doubt, call recall() and report exactly what
             "role": "user",
             "content": user_message,
         })
+
+        # ── Proactive recall ─────────────────────────────────────────────
+        # Don't rely on the LLM to call recall() — 7B models frequently skip
+        # tool calls and hallucinate answers. We always fetch relevant memories
+        # and inject them into context so the LLM has them available.
+        recall_result = await self._mcp.call_tool("recall", {
+            "query": user_message,
+            "top_k": 5,
+        })
+        if recall_result and "No memories found" not in recall_result:
+            self._conversation_history.append({
+                "role": "assistant",
+                "content": "Let me check my memory for relevant information.",
+                "tool_calls": [{
+                    "function": {
+                        "name": "recall",
+                        "arguments": {"query": user_message, "top_k": 5},
+                    }
+                }],
+            })
+            self._conversation_history.append({
+                "role": "tool",
+                "content": (
+                    recall_result
+                    + "\n\nREMINDER: Only use information from the above memories. "
+                    "Do not add details that are not present in these results."
+                ),
+            })
 
         # Agent loop: keep calling Ollama until we get a final response
         iterations = 0
@@ -665,10 +694,21 @@ will be caught immediately. When in doubt, call recall() and report exactly what
 
         context_str = "\n".join(context_parts)
 
-        # CRITICAL FIX: inject context into conversation history as a tool result.
-        # This means the LLM actually sees this memory when generating its first response.
-        # Without this injection, the LLM starts with an empty context window and
-        # has no choice but to fabricate answers about past events.
+        # Inject context as a proper assistant→tool message pair.
+        # An orphan role="tool" message (without a preceding assistant tool_call)
+        # violates Ollama's expected message format and may be ignored by the model.
+        # By adding a synthetic assistant tool_call first, the tool result is properly
+        # associated and the model sees the memory content reliably.
+        self._conversation_history.append({
+            "role": "assistant",
+            "content": "Let me load your information from past sessions.",
+            "tool_calls": [{
+                "function": {
+                    "name": "list_entities",
+                    "arguments": {},
+                }
+            }],
+        })
         self._conversation_history.append({
             "role": "tool",
             "content": (
